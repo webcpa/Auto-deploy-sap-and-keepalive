@@ -1,0 +1,92 @@
+# Workflow 名称
+name: 自动保活 SAP (Auto Restart SAP Apps)
+
+on:
+  # 定时触发器：cron 表达式使用 UTC 时间。'58 23 * * *' 对应北京时间早上 7:58
+  schedule:
+    - cron: '58 23 * * *'
+  # 允许在 Actions 页面手动触发
+  workflow_dispatch:
+
+jobs:
+  # 定义一个可重复使用的任务
+  restart-apps-in-region:
+    # 任务运行的虚拟环境
+    runs-on: ubuntu-latest
+    
+    # 使用 strategy/matrix 来为不同区域并行运行此任务
+    strategy:
+      fail-fast: false # 即使一个区域的任务失败，其他区域的任务也会继续
+      matrix:
+        # 定义区域矩阵，可在这里轻松增删区域
+        region:
+          - name: SG  # 新加坡
+            api: [https://api.cf.ap21.hana.ondemand.com](https://api.cf.ap21.hana.ondemand.com)
+          - name: US  # 美国
+            api: [https://api.cf.us10-001.hana.ondemand.com](https://api.cf.us10-001.hana.ondemand.com)
+
+    # 任务名称会显示区域，例如 "Restart Apps in SG"
+    name: Restart Apps in ${{ matrix.region.name }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install CF CLI
+      run: |
+        wget -q -O - [https://packages.cloudfoundry.org/debian/cli.cloudfoundry.org.key](https://packages.cloudfoundry.org/debian/cli.cloudfoundry.org.key) | sudo apt-key add -
+        echo "deb [https://packages.cloudfoundry.org/debian](https://packages.cloudfoundry.org/debian) stable main" | sudo tee /etc/apt/sources.list.d/cloudfoundry-cli.list
+        sudo apt-get update
+        sudo apt-get install -y cf8-cli
+
+    - name: Login to Cloud Foundry in ${{ matrix.region.name }}
+      run: |
+        CF_API="${{ matrix.region.api }}"
+        echo "使用API端点: $CF_API (区域: ${{ matrix.region.name }})"
+        
+        # 登录。注意：下面的脚本假设你的账号下只有一个组织(Org)和一个空间(Space)。
+        # 如果有多个，它会通过 awk 'NR==4' 命令默认选择列表中的第一个。
+        cf login -a "$CF_API" -u "${{ secrets.EMAIL }}" -p "${{ secrets.PASSWORD }}"
+        
+        ORG=$(cf orgs | awk 'NR==4 {print $1}')
+        SPACE=$(cf spaces | awk 'NR==4 {print $1}')
+        
+        # 重新定位到获取到的 Org 和 Space
+        cf target -o "$ORG" -s "$SPACE"
+        echo "已定位到 Org: $ORG, Space: $SPACE"
+
+    - name: Get all applications in ${{ matrix.region.name }}
+      id: get-apps
+      run: |
+        # 获取所有应用名称 (跳过表头)，并保存到输出变量中
+        apps=$(cf apps | awk 'NR>3 {print $1}' | grep -v '^$')
+        echo "发现的应用:"
+        echo "$apps"
+        echo "apps<<EOF" >> $GITHUB_OUTPUT
+        echo "$apps" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+
+    - name: Restart all applications in ${{ matrix.region.name }}
+      run: |
+        apps="${{ steps.get-apps.outputs.apps }}"
+        if [ -z "$apps" ]; then
+          echo "在区域 ${{ matrix.region.name }} 中未找到任何应用"
+          exit 0
+        fi
+        
+        echo "准备重启区域 ${{ matrix.region.name }} 中的应用:"
+        echo "$apps"
+        
+        for app in $apps; do
+          echo "正在重启应用: $app"
+          cf restart "$app"
+          echo "应用 $app 重启成功"
+          echo "----------------------------------------"
+          sleep 20
+        done
+
+    - name: Verify applications status in ${{ matrix.region.name }}
+      if: always() # 确保无论重启是否成功，都执行这一步
+      run: |
+        echo "区域 ${{ matrix.region.name }} 中所有应用的最终状态:"
+        cf apps
